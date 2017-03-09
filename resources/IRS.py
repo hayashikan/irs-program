@@ -8,6 +8,7 @@ import os, sys, json, copy
 import pandas as pd
 import numpy as np
 import datetime, math
+import calendar
 
 def byteify(input):
     if isinstance(input, dict):
@@ -35,7 +36,6 @@ class Integrated_Reporting_System(object):
         self.spec = byteify(self.spec)
         self.folders = self.file_validate()
         self.curdf = dict()
-        self.full_report = pd.DataFrame()
         self.full_agglist = None
         self.csv_config = {
             'encoding': 'utf-8-sig',
@@ -45,9 +45,9 @@ class Integrated_Reporting_System(object):
 
     def file_validate(self):
         root = self.spec['Directory']['Open']
-        if self.spec['Frequency']=='Monthly':
+        if self.spec['Frequency']=='Monthly' or self.spec['Frequency']=='Weekday-weekend (Monthly data)':
             w = 'M'
-        if self.spec['Frequency']=='Daily' or self.spec['Frequency']=='Daily Average':
+        if self.spec['Frequency']=='Daily' or self.spec['Frequency']=='Daily Average' or self.spec['Frequency']=='Weekday-weekend (Daily data)':
             w = 'D'
         files = [f for f in os.listdir(root) 
             if os.path.isfile(os.path.join(root, f)) and f.startswith(w)]
@@ -120,6 +120,25 @@ class Integrated_Reporting_System(object):
                     left_on='Individual_ID', right_on='Individual_ID', how='left')
 
 
+    def confirm_metric(self, slabeltime, elabeltime, stime, etime, weighting):
+        if self.spec['Metrics'] == ['Reach (000)']:
+            return self.confirm_reach(slabeltime, elabeltime, stime, etime, weighting)
+        if self.spec['Metrics'] == ['Total Minutes (000)']:
+            return self.confirm_time(slabeltime, elabeltime, stime, etime, weighting)
+        raise KeyError('Too many metrics! Please choose only ONE metric for day part report')
+
+
+    def confirm_time(self, slabeltime, elabeltime, stime, etime, weighting):
+        if stime <= elabeltime and etime >= slabeltime:
+            stime = stime.to_datetime()
+            etime = etime.to_datetime()
+            start_time = max(stime, slabeltime)
+            end_time = min(etime, elabeltime)
+            return (end_time - start_time).total_seconds() * weighting
+        else:
+            return 0
+
+
     def confirm_reach(self, slabeltime, elabeltime, stime, etime, weighting):
         if stime <= elabeltime and etime >= slabeltime:
             return weighting
@@ -154,9 +173,14 @@ class Integrated_Reporting_System(object):
             etime_label = datetime.datetime.strftime(cur_etime, '%H:%M:%S')
             cur_label = stime_label + ' - ' + etime_label
             timeslots.append(cur_label)
-            self.curdf['APPSWD'][cur_label] = self.curdf['APPSWD'].apply(
-                lambda row: self.confirm_reach(cur_stime, cur_etime, 
-                    row['Start_Time'], row['End_Time'], row['Individual_Weighting']), axis=1)
+            if self.spec['Metrics'] == ['Reach (000)']:
+                self.curdf['APPSWD'][cur_label] = self.curdf['APPSWD'].apply(
+                    lambda row: self.confirm_reach(cur_stime, cur_etime, 
+                        row['Start_Time'], row['End_Time'], row['Individual_Weighting']), axis=1)
+            if self.spec['Metrics'] == ['Total Minutes (000)']:
+                self.curdf['APPSWD'][cur_label] = self.curdf['APPSWD'].apply(
+                    lambda row: self.confirm_time(cur_stime, cur_etime, 
+                        row['Start_Time'], row['End_Time'], row['Individual_Weighting']), axis=1)
             cur_stime += td
             print cur_label
         self.spec['ReportType']['timeslots'] = timeslots
@@ -307,6 +331,12 @@ class Integrated_Reporting_System(object):
 
         if 'Reach (000)' in self.spec['Metrics']:
             data['Reach (000)'] = reach['Individual_Weighting']
+
+        # if 'Installed Reach (000)'  in self.spec['Metrics']:
+        #     data['Installed Reach (000)'] = reach['Individual_Weighting']
+
+        # if 'Uninstalled Reach (000)' in self.spec['Metrics']:
+        #     data['Uninstalled Reach (000)'] = reach['Individual_Weighting']
             
         if 'Reach (%)' in self.spec['Metrics']:
             reach_percent = reach['Individual_Weighting'] / universe
@@ -389,7 +419,7 @@ class Integrated_Reporting_System(object):
         return df
 
 
-    def daypart_app_report(self, groupdf, groupname, universe):
+    def __daypart_app_report_reach(self, groupdf, groupname, universe):
         aggcol = self.spec['UnitOfAnalysis']['AggCol']
         agg_dict = {label:np.max for label in self.spec['ReportType']['timeslots']}
         agg_dict[aggcol] = np.min
@@ -400,9 +430,28 @@ class Integrated_Reporting_System(object):
         return groupdf
 
 
-    def generate_single_daypart_app_report(self, idx):
-        self.parse_folder(idx)
-        self.pre_aggregate_process()
+    def __daypart_app_report_total_timespent(self, groupdf, groupname, universe):
+        aggcol = self.spec['UnitOfAnalysis']['AggCol']
+        agg_dict = {label:np.sum for label in self.spec['ReportType']['timeslots']}
+        groupdf = groupdf.groupby(aggcol).agg(agg_dict)
+        groupdf = groupdf / 60
+        groupdf = groupdf[self.spec['ReportType']['timeslots']]
+        return groupdf
+
+
+    def daypart_app_report(self, groupdf, groupname, universe):
+        if self.spec['Metrics'] == ['Reach (000)']:
+            return self.__daypart_app_report_reach(groupdf, groupname, universe)
+        if self.spec['Metrics'] == ['Total Minutes (000)']:
+            return self.__daypart_app_report_total_timespent(groupdf, groupname, universe)
+        raise KeyError('Too many metrics!')
+
+
+    def generate_single_daypart_app_report(self, idx, parse=True, pre_process=True):
+        if parse:
+            self.parse_folder(idx)
+        if pre_process:
+            self.pre_aggregate_process()
         self.pre_daypart_report_process()
 
         groupdf = self.curdf['APPSWD']
@@ -414,9 +463,11 @@ class Integrated_Reporting_System(object):
         return daypart_report
 
 
-    def generate_single_standard_app_report(self, idx):
-        self.parse_folder(idx)
-        self.pre_aggregate_process()
+    def generate_single_standard_app_report(self, idx, parse=True, pre_process=True):
+        if parse:
+            self.parse_folder(idx)
+        if pre_process:
+            self.pre_aggregate_process()
         self.pre_usage_report_process()
         
         groupdf = self.curdf['APPSWD']
@@ -429,9 +480,27 @@ class Integrated_Reporting_System(object):
         return std_report
 
 
-    def generate_single_standard_web_report(self, idx):
-        self.parse_folder(idx)
-        self.pre_aggregate_process()
+    def generate_single_installation_app_report(self, idx, parse=True, pre_process=True):
+        pass
+
+
+    def generate_single_by_target_installation_app_report(self, idx, parse=True, pre_process=True):
+        pass
+
+
+    def generate_single_data_usage_report(self, idx, parse=True, pre_process=True):
+        pass
+
+
+    def generate_single_by_target_data_usage_report(self, idx, parse=True, pre_process=True):
+        pass
+
+
+    def generate_single_standard_web_report(self, idx, parse=True, pre_process=True):
+        if parse:
+            self.parse_folder(idx)
+        if pre_process:
+            self.pre_aggregate_process()
         self.pre_usage_report_process()
         
         groupdf = self.curdf['WEBSWD']
@@ -444,8 +513,8 @@ class Integrated_Reporting_System(object):
         return std_report
 
 
-    def generate_single_by_target_app_report(self, idx):
-        main_report = self.generate_single_standard_app_report(idx)
+    def generate_single_by_target_app_report(self, idx, parse=True, pre_process=True):
+        main_report = self.generate_single_standard_app_report(idx, parse, pre_process)
         for tg_group in self.spec['ReportType']['TargetGroup']:
             groupname = tg_group['GroupName']
             groupquery = tg_group['Query']
@@ -459,8 +528,8 @@ class Integrated_Reporting_System(object):
         return main_report
 
 
-    def generate_single_by_target_web_report(self, idx):
-        main_report = self.generate_single_standard_web_report(idx)
+    def generate_single_by_target_web_report(self, idx, parse=True, pre_process=True):
+        main_report = self.generate_single_standard_web_report(idx, parse, pre_process)
         for tg_group in self.spec['ReportType']['TargetGroup']:
             groupname = tg_group['GroupName']
             groupquery = tg_group['Query']
@@ -474,19 +543,152 @@ class Integrated_Reporting_System(object):
         return main_report
 
 
-    def generate_single_report(self, idx):
+    def generate_single_by_target_daypart_app_report(self, idx, parse=True, pre_process=True):
+        main_report = self.generate_single_daypart_app_report(idx, parse, pre_process)
+        daypart_groupdfs = [main_report]
+        daypart_groupnames = ['All']
+        for tg_group in self.spec['ReportType']['TargetGroup']:
+            groupname = tg_group['GroupName']
+            groupquery = tg_group['Query']
+            groupuser = set(self.curdf['DEM'].query(groupquery)['Individual_ID'].unique())
+            universe = self.curdf['DEM'].query(groupquery)['Individual_Weighting'].sum()
+            groupdf = self.curdf['APPSWD'][self.curdf['APPSWD']['Individual_ID'].isin(groupuser)]
+            group_report = self.daypart_app_report(groupdf, groupname, universe)
+            group_report = pd.merge(left=self.agglist, right=group_report,
+                left_on=self.spec['UnitOfAnalysis']['AggCol'], right_index=True, how='right')
+            daypart_groupdfs.append(group_report)
+            daypart_groupnames.append(groupname)
+        main_report = pd.concat(daypart_groupdfs, keys=daypart_groupnames)
+        main_report.reset_index(level=0, inplace=True)
+        main_report.rename(columns={main_report.columns[0]: 'Target Group'}, inplace=True)
+        return main_report
+
+
+    def monthly_weekday_weekend_analysis(self, idx):
+        parse = False
+        pre_process = False
+        self.parse_folder(idx)
+        self.pre_aggregate_process()
+        self.__valid_metrics()
+
+        weekday_df = pd.DataFrame()
+        weekend_df = pd.DataFrame()
+        num_weekdays = 0
+        num_weekends = 0
+        year = int(self.folders[idx][1:5])
+        month = int(self.folders[idx][-2:])
+        days_of_month = calendar.monthrange(year, month)[1]
+
         if self.spec['Object']=='App':
-            if self.spec['ReportType']['Type']=='Usage Report':
-                return self.generate_single_standard_app_report(idx)
-            if self.spec['ReportType']['Type']=='Usage By Target Report':
-                return self.generate_single_by_target_app_report(idx)
-            if self.spec['ReportType']['Type']=='Usage Day Part Report':
-                return self.generate_single_daypart_app_report(idx)
+            monthly_df = self.curdf['APPSWD']
         if self.spec['Object']=='Web':
-            if self.spec['ReportType']['Type']=='Usage Report':
-                return self.generate_single_standard_web_report(idx)
-            if self.spec['ReportType']['Type']=='Usage By Target Report':
-                return self.generate_single_by_target_web_report(idx)
+            monthly_df = self.curdf['WEBSWD']
+
+        # separate days
+        for day in range(1, days_of_month+1):
+            current_date = str(year) + str(month).zfill(2) + str(day).zfill(2)
+            print 'processing: %d / %d days of %d %d' % (day, days_of_month, year, month)
+            day_number = datetime.date(year, month, day).weekday()
+            if self.spec['Object']=='App':
+                self.curdf['APPSWD'] = monthly_df[monthly_df['Date']==current_date]
+                if self.spec['ReportType']['Type']=='Usage Report':
+                    day_df = self.generate_single_standard_app_report(idx, parse, pre_process)
+                if self.spec['ReportType']['Type']=='Usage By Target Report':
+                    day_df = self.generate_single_by_target_app_report(idx, parse, pre_process)
+                if self.spec['ReportType']['Type']=='Usage Day Part Report':
+                    day_df = self.generate_single_daypart_app_report(idx, parse, pre_process)
+                if self.spec['ReportType']['Type']=='Usage Day Part By Target Report':
+                    day_df = self.generate_single_by_target_daypart_app_report(idx, parse, pre_process)
+            if self.spec['Object']=='Web':
+                self.curdf['WEBSWD'] = monthly_df[monthly_df['Date']==current_date]
+                if self.spec['ReportType']['Type']=='Usage Report':
+                    day_df = self.generate_single_standard_web_report(idx, parse, pre_process)
+                if self.spec['ReportType']['Type']=='Usage By Target Report':
+                    day_df = self.generate_single_by_target_web_report(idx, parse, pre_process)
+            if day_number <= 4:
+                weekday_df = weekday_df.append(day_df)
+                num_weekdays += 1
+            else:
+                weekend_df = weekend_df.append(day_df)
+                num_weekends += 1
+
+        # average method
+        self.full_agglist = self.agglist
+        self.agglist_cols = list(self.agglist.columns)
+        self.agglist_cols.remove(self.spec['UnitOfAnalysis']['AggCol'])
+        weekday_df.drop(self.agglist_cols, axis=1, inplace=True)
+        weekday_df = self.average_report(weekday_df, num_weekdays)
+        weekend_df.drop(self.agglist_cols, axis=1, inplace=True)
+        weekend_df = self.average_report(weekend_df, num_weekends)
+
+        report = pd.concat([weekday_df, weekend_df], keys=['Weekday', 'Weekend'])
+        report.reset_index(level=0, inplace=True)
+        report.rename(columns={report.columns[0]: 'Day of Week'}, inplace=True)
+        return report
+
+
+    def daily_weekday_weekend_analysis(self, idx, cmd, weekday_df=None, weekend_df=None, num_weekdays=0,
+        num_weekends=0, df=None):
+
+        if cmd == 'init':
+            weekday_df = pd.DataFrame()
+            weekend_df = pd.DataFrame()
+            return (weekday_df, weekend_df, num_weekdays, num_weekends)
+
+        if cmd == 'append':
+            if not isinstance(df, pd.DataFrame):
+                raise KeyError('')
+            d = self.folders[idx]
+            year = int(d[1:5])
+            month = int(d[5:7])
+            day = int(d[7:])
+            day_number = datetime.date(year, month, day).weekday()
+            if day_number <= 4:
+                weekday_df = weekday_df.append(df)
+                return (weekday_df, weekend_df, num_weekdays+1, num_weekends)
+            if day_number > 4:
+                weekend_df = weekend_df.append(df)
+                return (weekday_df, weekend_df, num_weekdays, num_weekends+1)
+
+        if cmd == 'average':
+            if len(weekday_df) > 0:
+                weekday_df = self.average_report(weekday_df, num_weekdays)
+            if len(weekend_df) > 0:
+                weekend_df = self.average_report(weekend_df, num_weekends)
+            report = pd.concat([weekday_df, weekend_df], keys=['Weekday', 'Weekend'])
+            report.reset_index(level=0, inplace=True)
+            report.rename(columns={report.columns[0]: 'Day of Week'}, inplace=True)
+            return report
+
+
+    def generate_single_report(self, idx):
+        if self.spec['Frequency'] != 'Weekday-weekend (Monthly data)':
+            if self.spec['Object']=='App':
+                if self.spec['ReportType']['Type']=='Usage Report':
+                    return self.generate_single_standard_app_report(idx)
+                if self.spec['ReportType']['Type']=='Usage By Target Report':
+                    return self.generate_single_by_target_app_report(idx)
+                if self.spec['ReportType']['Type']=='Usage Day Part Report':
+                    return self.generate_single_daypart_app_report(idx)
+                if self.spec['ReportType']['Type']=='Usage Day Part By Target Report':
+                    return self.generate_single_by_target_daypart_app_report(idx)
+                # if self.spec['ReportType']['Type']=='Installation Report':
+                #     return self.generate_single_installation_app_report(idx)
+                # if self.spec['ReportType']['Type']=='Installation By Target Report':
+                #     return self.generate_single_by_target_installation_app_report(idx)
+                # if self.spec['ReportType']['Type']=='Data Usage Report':
+                #     return self.generate_single_data_usage_report(idx)
+                # if self.spec['ReportType']['Type']=='Data Usage By Target Report':
+                #     return self.generate_single_by_target_data_usage_report(idx)
+            if self.spec['Object']=='Web':
+                if self.spec['ReportType']['Type']=='Usage Report':
+                    return self.generate_single_standard_web_report(idx)
+                if self.spec['ReportType']['Type']=='Usage By Target Report':
+                    return self.generate_single_by_target_web_report(idx)
+        if self.spec['Frequency'] == 'Weekday-weekend (Monthly data)':
+            print 'Weekday-weekend (Monthly data)'
+            return self.monthly_weekday_weekend_analysis(idx)
+
 
 
     def __update_new_agglist_value(self, new_aggname, old, new):
@@ -521,20 +723,24 @@ class Integrated_Reporting_System(object):
         return full_agglist
 
 
-    def daily_average_report(self):
-        # average method
-        cols = list(self.full_report.columns)
+    def daily_average_report(self, full_report, num_days=None):
+        # average method & clean format
+        cols = list(full_report.columns)
         metric_cols = copy.deepcopy(cols)
         metric_cols.remove(self.spec['UnitOfAnalysis']['AggCol'])
+        avg_aggcol = self.spec['UnitOfAnalysis']['AggCol']
+        if 'Target Group' in metric_cols:
+            metric_cols.remove('Target Group')
+            avg_aggcol = ['Target Group', self.spec['UnitOfAnalysis']['AggCol']]
         agg_dict = {col: np.sum for col in metric_cols}
 
         # aggregate
-        daily_average_report = self.full_report.groupby(self.spec['UnitOfAnalysis']['AggCol']).agg(
-            agg_dict)
+        daily_average_report = full_report.groupby(avg_aggcol).agg(agg_dict)
         daily_average_report = daily_average_report[metric_cols]
 
         # weighted average for 3 metrics
-        num_days = len(self.folders)
+        if num_days==None:
+            num_days = len(self.folders)
         for col in metric_cols:
             daily_average_report[col] = daily_average_report[col] / num_days
         for col in metric_cols:
@@ -555,7 +761,7 @@ class Integrated_Reporting_System(object):
         # delete unwanted columns
         drop_cols = []
         for col in metric_cols:
-            if self.spec['ReportType']['Type']!='Usage Day Part Report':
+            if self.spec['ReportType']['Type']!='Usage Day Part Report' and self.spec['ReportType']['Type']!='Usage Day Part By Target Report':
                 m = col.rsplit(':', 1)[1]
             else:
                 m = col
@@ -564,38 +770,63 @@ class Integrated_Reporting_System(object):
         daily_average_report.drop(drop_cols, axis=1, inplace=True)
 
         # join updated agglist
+        if 'Target Group' in cols:
+            daily_average_report.reset_index(inplace=True)
+            daily_average_report.set_index(self.spec['UnitOfAnalysis']['AggCol'], inplace=True)
         daily_average_report = pd.merge(left=self.full_agglist, right=daily_average_report,
             left_on=self.spec['UnitOfAnalysis']['AggCol'],
-            right_index=True,
-            how='right')
-        
+            right_index=True, how='right')
+
+        # formatting
+        if 'Target Group' in cols:
+            cols = list(daily_average_report.columns)
+            cols.remove('Target Group')
+            cols = ['Target Group'] + cols
+            daily_average_report = daily_average_report[cols]
+
+        daily_average_report = daily_average_report.replace(np.nan, 0)
         return daily_average_report
 
 
-    def average_report(self):
-        return self.daily_average_report()
+    def average_report(self, full_report, num_days=None):
+        return self.daily_average_report(full_report, num_days)
 
 
     def __valid_metrics(self):
         self.period_metric = copy.deepcopy(self.spec['Metrics'])
-        if 'Reach (000)' not in self.period_metric:
-            self.spec['Metrics'].append('Reach (000)')
-        if 'Time Per User (in minutes)' in self.period_metric and 'Total Minutes (000)' not in self.period_metric:
-            self.spec['Metrics'].append('Total Minutes (000)')
-        if 'Sessions Per User' in self.period_metric and 'Total Sessions (000)' not in self.period_metric:
-            self.spec['Metrics'].append('Total Sessions (000)')
-        if 'Page Views Per User' in self.period_metric and 'Total Page Views (000)' not in self.period_metric:
-            self.spec['Metrics'].append('Total Page Views (000)')
+        if 'Time Per User (in minutes)' in self.period_metric:
+            if 'Total Minutes (000)' not in self.period_metric:
+                self.spec['Metrics'].append('Total Minutes (000)')
+            if 'Reach (000)' not in self.spec['Metrics']:
+                self.spec['Metrics'].append('Reach (000)')
+        if 'Sessions Per User' in self.period_metric:
+            if 'Total Sessions (000)' not in self.period_metric:
+                self.spec['Metrics'].append('Total Sessions (000)')
+            if 'Reach (000)' not in self.spec['Metrics']:
+                self.spec['Metrics'].append('Reach (000)')
+        if 'Page Views Per User' in self.period_metric:
+            if 'Total Page Views (000)' not in self.period_metric:
+                self.spec['Metrics'].append('Total Page Views (000)')
+            if 'Reach (000)' not in self.spec['Metrics']:
+                self.spec['Metrics'].append('Reach (000)')
+        print self.spec['Metrics'], self.period_metric
 
 
     def generate_report(self):
         save_single_report = False
         period_average = False
-        if self.spec['Frequency'] == 'Daily' or self.spec['Frequency'] == 'Monthly':
+        period_weekly_average = False
+        if self.spec['Frequency'] == 'Daily' or self.spec['Frequency'] == 'Monthly' or self.spec['Frequency'] == 'Weekday-weekend (Monthly data)':
             save_single_report = True
         if self.spec['Frequency'] == 'Daily Average':
             period_average = True
+            full_report = pd.DataFrame()
             self.__valid_metrics()
+        if self.spec['Frequency'] == 'Weekday-weekend (Daily data)':
+            period_weekly_average = True
+            self.__valid_metrics()
+            weekday_df, weekend_df, num_weekdays, num_weekends = \
+                self.daily_weekday_weekend_analysis(0, cmd='init', num_weekdays=0, num_weekends=0)
 
         for idx in range(len(self.folders)):
             print 'processing: %d / %d folders' % (idx+1, len(self.folders))
@@ -606,12 +837,22 @@ class Integrated_Reporting_System(object):
                         % (self.spec['Frequency'], self.spec['Object'], self.spec['ReportType']['Type'], \
                             self.folders[idx][1:]))
                 single_report.to_csv(file_name, **self.csv_config)
-            if period_average:
+            if period_average or period_weekly_average:
                 self.full_agglist = self.update_full_agglist()
                 single_report.drop(self.agglist_cols, inplace=True, axis=1)
-                self.full_report = self.full_report.append(single_report)
-        if period_average:
-            daily_average_report = self.average_report()
+            if period_average:
+                full_report = full_report.append(single_report)
+            if period_weekly_average:
+                weekday_df, weekend_df, num_weekdays, num_weekends = \
+                    self.daily_weekday_weekend_analysis(idx, cmd='append', weekday_df=weekday_df,
+                        weekend_df=weekend_df, num_weekdays=num_weekdays, num_weekends=num_weekends, df=single_report)
+
+        if period_average or period_weekly_average:
+            if period_average:
+                daily_average_report = self.average_report(full_report)
+            if period_weekly_average:
+                daily_average_report = self.daily_weekday_weekend_analysis(0, cmd='average', 
+                    weekday_df=weekday_df, weekend_df=weekend_df, num_weekdays=num_weekdays, num_weekends=num_weekends)
             report_name = '%s %s %s %s - %s.csv'
             file_name = os.path.join(self.spec['Directory']['Save'], report_name \
                 % (self.spec['Frequency'], self.spec['Object'], self.spec['ReportType']['Type'], \
